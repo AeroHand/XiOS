@@ -1,0 +1,22 @@
+#include <stdint.h>
+
+#include "ece391support.h"
+#include "ece391syscall.h"
+
+int main ()
+{
+    int32_t cnt;
+    uint8_t buf[1024];
+
+    ece391_fdputs (1, (uint8_t*)"Hi, what's your name? ");
+    if (-1 == (cnt = ece391_read (0, buf, 1023))) {
+        ece391_fdputs (1, (uint8_t*)"Can't read name from keyboard.\n");
+	return 3;
+    }
+    buf[cnt] = '\0';
+    ece391_fdputs (1, (uint8_t*)"Hello, ");
+    ece391_fdputs (1, buf);
+
+    return 0;
+}
+

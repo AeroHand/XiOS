@@ -1,0 +1,11 @@
+*.o
+.*.swp
+.DS_Store
+.gdb_history
+bootimg
+Makefile.dep
+mac_mp3.img
+mp3.img
+linux_launch_qemu.sh
+linux_run.sh
+html

@@ -1,0 +1,285 @@
+// vim: tw=80:ts=4:sw=4:et
+#include "types.h"
+#include "syscall.h"
+#include "fs.h"
+#include "lib.h"
+#include "keyboard.h"
+#include "task.h"
+
+file_info_t open_files[8];
+
+extern process_t *current_process;
+
+static file_ops_t terminal_funcs = {.read_func = keyboard_read,
+    .write_func = keyboard_write,
+    .open_func = keyboard_open,
+};
+
+static file_ops_t fs_funcs = {.read_func = read_data,
+    .write_func = fs_write,
+    .open_func = fs_open,
+};
+
+static file_ops_t rtc_funcs = {.read_func = rtc_read,
+    .write_func = rtc_write,
+    .open_func = rtc_open,
+};
+
+// find the first unused file descriptor
+// returns -1 if all files are in use
+int32_t find_new_fd();
+
+void syscall_handler() {
+    // save state
+	asm("pushl %es;         \
+		 pushl %ds;         \
+		 pushl %eax;        \
+		 pushl %ebp;        \
+		 pushl %edi;        \
+		 pushl %esi;        \
+		 pushl %edx;        \
+		 pushl %ecx;        \
+		 pushl %ebx;        \
+		 movl $0x0018,%edx; \
+	     movl %edx,%ds;     \
+		 movl %edx,%es;     "
+		);
+    // get arguments from %ebx, %ecx, %edx
+    uint32_t num;
+    uint32_t arg1;
+    uint32_t arg2;
+    uint32_t arg3;
+    // the register allocations specified for the inputs ask GCC to store the
+    // registers into their correct local variables, so no body is needed
+    // (= specifies write-only)
+    asm(""
+            : "=a"(num), "=b"(arg1), "=c"(arg2), "=d"(arg3)
+            : /* no outputs */);
+    // call the handler of the appropriate system call
+
+    uint32_t ret;
+    switch(num) {
+        case SYSCALL_EXECUTE:
+            ret = syscall_execute((uint8_t*) arg1);
+            break;
+        case SYSCALL_OPEN:
+            ret = syscall_open((uint8_t*)arg1);
+            break;
+        case SYSCALL_READ:
+            ret = syscall_read(arg1, (uint8_t*)arg2, arg3);
+            break;
+        case SYSCALL_WRITE:
+            ret = syscall_write(arg1, (uint8_t*)arg2, arg3);
+            break;
+        case SYSCALL_CLOSE:
+            ret = syscall_close((int32_t) arg1);
+            break;
+        case SYSCALL_SET_HANDLER:
+            ret = syscall_set_handler(arg1, (void *) arg2);
+            break;
+        case SYSCALL_SIGRETURN:
+            ret = syscall_sigreturn();
+            break;
+        default:
+            ret = -1;
+    }
+
+    // restore state
+	asm volatile ("popl %ebx;  \
+				   popl %ecx;  \
+				   popl %edx;  \
+				   popl %esi;  \
+				   popl %edi;  \
+				   popl %ebp;  \
+				   popl %eax;  \
+				   popl %ds;   \
+				   popl %es;   "
+				  );
+    // setup the stack with appropriate CS,DS,EFLAGS,return address for user mode
+	// 0x23 = 0x20 (User data segment) | 0x03 (User privilege level)
+	// 0x1B = 0x18 (User code segment) | 0x03 (User privilege level)
+	// return to user mode
+	
+	
+	asm volatile("cli;               \
+				  mov $0x23, %%ax;   \
+		          mov %%ax, %%ds;    \
+		          mov %%ax, %%es;    \
+		          mov %%ax, %%fs;    \
+		          mov %%ax, %%gs;    \
+				  mov %%esp, %%eax;  \
+		          pushl $0x23;       \
+		          pushl %%eax;       \
+		          pushf;             \
+				  popl %%eax;        \
+				  orl $0x200, %%eax; \
+				  pushl %%eax;       \
+		          pushl $0x1B;       \
+		          push $1f;          \
+				  mov %0, %%eax;     \
+				  iret;              \
+	            1:                   \
+				                     " 
+		         :
+				 :"r"(ret)
+				 :"%eax", "cc", "memory"
+				 );               
+				  
+	
+	/* Previous ASM code should take care of this:
+	
+	// set %eax to the return value of the kernel handler (to send to user)
+    asm(""
+            :
+            : "a"(ret)
+       );
+	
+    // iret to get back to user code
+    asm volatile("leave": : :"memory");
+    asm volatile("iret": : :"memory");
+	*/
+}
+
+int32_t generate_syscall(int32_t num, int32_t arg1, int32_t arg2, int32_t arg3) {
+    asm(""
+            : /* no inputs */
+            : "a"(num), "b"(arg1), "c"(arg2), "d"(arg3)
+       );
+	asm volatile ("int $0x80;"
+		:
+		:
+		: "cc", "memory");
+    int32_t ret;
+    asm (""
+            :"=a"(ret)
+        );
+    return ret;
+}
+
+int32_t syscall_open(uint8_t* filename) {
+    if (strncmp((int8_t*)filename, "/dev/stdin", 100) == 0) {
+        file_info_t stdin_info = {
+            .file_ops = &terminal_funcs,
+            .inode_ptr = NULL,
+            .pos = 0,
+        };
+        stdin_info.can_read = 1;
+        stdin_info.can_write = 0;
+        stdin_info.in_use = 1;
+        stdin_info.type = FILE_TERMINAL;
+        open_files[STDIN_FD] = stdin_info;
+        return STDIN_FD;
+    } else if (strncmp((int8_t*)filename, "/dev/stdout", 100) == 0) {
+        file_info_t stdout_info = {
+            .file_ops = &terminal_funcs,
+            .inode_ptr = NULL,
+            .pos = 0,
+        };
+        stdout_info.can_read = 0;
+        stdout_info.can_write = 1;
+        stdout_info.type = FILE_TERMINAL;
+        stdout_info.in_use = 1;
+        open_files[STDOUT_FD] = stdout_info;
+        return STDOUT_FD;
+    } else if (strncmp((int8_t*)filename, "/dev/rtc", 100) == 0)  {
+        file_info_t rtc_info = {
+            .file_ops = &rtc_funcs,
+            .inode_ptr = NULL,
+            .pos = 0,
+        };
+        rtc_info.can_read = 1;
+        rtc_info.can_write = 1;
+        rtc_info.type = FILE_RTC;
+        rtc_info.in_use = 1;
+        int32_t file_num = find_new_fd();
+        if (file_num < 0) {
+            return -1;
+        } else {
+            open_files[file_num] = rtc_info;
+            return file_num;
+        }
+    } else {
+        dentry_t dentry;
+        if (read_dentry_by_name(filename, &dentry)) {
+            return -1;
+        }
+        file_info_t fs_info = {
+            .file_ops = &fs_funcs,
+            .inode_ptr = get_inode_ptr(dentry.inode),
+            .pos = 0,
+        };
+        fs_info.can_read = 1;
+        fs_info.can_write = 0;
+        fs_info.type = FILE_REGULAR;
+        fs_info.in_use = 1;
+        int32_t file_num = find_new_fd();
+        if (file_num < 0) {
+            return -1;
+        } else {
+            open_files[file_num] = fs_info;
+            return file_num;
+        }
+    }
+}
+
+int32_t syscall_execute(const uint8_t *command) {
+    return -1;
+}
+
+int32_t syscall_read(int32_t fd, const uint8_t* buf, int32_t nbytes) {
+    if (valid_fd(fd) && open_files[fd].can_read) {
+        file_info_t* f = &open_files[fd];
+        // somehow interrupts are disabled while we're handling this
+        // interrupt, so re-enable them for the read
+        sti();
+        int32_t bytes_read = f->file_ops->read_func(f->inode_ptr, f->pos, (uint8_t*)buf, nbytes);
+        cli();
+        f->pos += bytes_read;
+        return bytes_read;
+    }
+    return -1;
+}
+
+int32_t syscall_write(int32_t fd, const uint8_t* buf, int32_t nbytes) {
+    if (valid_fd(fd) && open_files[fd].can_write) {
+        file_info_t* f = &open_files[fd];
+        f->file_ops->write_func((int8_t*)buf, nbytes);
+        return 0;
+    }
+    return -1;
+}
+
+int32_t syscall_close(int32_t fd) {
+    if (valid_fd(fd) && fd != STDIN_FD && fd != STDOUT_FD) {
+        open_files[fd].in_use = 0;
+        return 0;
+    }
+    return -1;
+}
+
+int32_t syscall_set_handler(int32_t signum, void* handler_address)
+{
+    return -1;
+}
+
+int32_t syscall_sigreturn(void)
+{
+    return -1;
+}
+
+int8_t valid_fd(int32_t fd) {
+    if (0 <= fd && fd < 8 && open_files[fd].in_use)
+        return 1;
+    else
+        return 0;
+}
+
+int32_t find_new_fd() {
+    int32_t fd;
+    for (fd = 0; fd < 8; fd++) {
+        if (open_files[fd].in_use == 0) {
+            return fd;
+        }
+    }
+    return -1;
+}

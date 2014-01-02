@@ -1,0 +1,4 @@
+rm bootimg
+rm filesys_img
+write bootimg bootimg
+write filesys_img filesys_img
